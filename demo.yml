@@ -1,0 +1,8 @@
+---
+- name: Check connectivity to managed hosts
+  hosts: all
+  gather_facts: no
+
+  tasks:
+    - name: Ping test
+      ansible.builtin.ping:
