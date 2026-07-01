@@ -1,6 +1,6 @@
 ---
 - name: Check connectivity to managed hosts
-  hosts: all
+  hosts: ubuntu
   gather_facts: no
 
   tasks:
