@@ -1,8 +1,171 @@
 ---
-- name: Check connectivity to managed hosts
-  hosts: ubuntu
-  gather_facts: no
+# ============================================================
+# restart_service_remediation.yml
+#
+# Triggered by: ServiceNow (via AAP webhook / job template)
+# Inventory:    static inventory (no dynamic AWS lookup)
+#
+# Extra vars expected from ServiceNow / AAP survey:
+#   ticket_number   - e.g. INC0012345
+#   target_server   - inventory hostname or group
+#   service_name    - e.g. nginx, httpd, tomcat
+#
+# Design notes:
+#   - Circuit breaker: only ONE restart attempt per run. If the
+#     service still isn't up after that single restart, we stop
+#     and hand off to a human instead of looping.
+#   - ServiceNow ticket is updated at every decision point so the
+#     ticket tells the whole story without needing the AAP logs.
+# ============================================================
+
+- name: Service restart remediation
+  hosts: "{{ target_server }}"
+  gather_facts: false
+  become: true
+
+  vars:
+    snow_instance: "https://yourcompany.service-now.com"
+    snow_table: "incident"
+    max_restart_attempts: 1
+
+  vars_prompt:
+    - name: ticket_number
+      prompt: "Enter ServiceNow ticket number"
+      private: false
 
   tasks:
-    - name: Ping test
+
+    # ----------------------------------------------------------
+    # 1. Confirm the target host actually exists in inventory
+    #    ("Server found?" decision diamond)
+    # ----------------------------------------------------------
+    - name: Fail fast if host is not in static inventory
+      ansible.builtin.meta: end_host
+      when: inventory_hostname not in groups['all']
+
+    # ----------------------------------------------------------
+    # 2. Confirm we can connect ("Connected OK?" decision diamond)
+    # ----------------------------------------------------------
+    - name: Check connectivity to server
       ansible.builtin.ping:
+      register: connect_result
+      ignore_errors: true
+
+    - name: Notify team - could not connect
+      ansible.builtin.uri:
+        url: "{{ snow_instance }}/api/now/table/{{ snow_table }}/{{ ticket_number }}"
+        method: PATCH
+        user: "{{ snow_user }}"
+        password: "{{ snow_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          work_notes: "AAP could not connect to {{ inventory_hostname }}. Manual intervention required."
+          state: "2"   # In Progress / needs human
+      delegate_to: localhost
+      when: connect_result is failed
+
+    - name: End play if connection failed
+      ansible.builtin.meta: end_play
+      when: connect_result is failed
+
+    # ----------------------------------------------------------
+    # 3. Check if the service is actually stopped
+    #    ("Stopped?" decision diamond)
+    # ----------------------------------------------------------
+    - name: Gather current service status
+      ansible.builtin.systemd:
+        name: "{{ service_name }}"
+      register: service_status
+
+    - name: Set stopped fact
+      ansible.builtin.set_fact:
+        service_was_stopped: "{{ service_status.status.ActiveState != 'active' }}"
+
+    # ----------------------------------------------------------
+    # 4a. If it was NOT actually stopped, just verify and close
+    # ----------------------------------------------------------
+    - name: Confirm service is running (false alarm path)
+      ansible.builtin.systemd:
+        name: "{{ service_name }}"
+      register: recheck_not_stopped
+      when: not service_was_stopped
+
+    - name: Close ticket - service was already running
+      ansible.builtin.uri:
+        url: "{{ snow_instance }}/api/now/table/{{ snow_table }}/{{ ticket_number }}"
+        method: PATCH
+        user: "{{ snow_user }}"
+        password: "{{ snow_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          work_notes: "Service {{ service_name }} on {{ inventory_hostname }} was already running. No action needed."
+          state: "6"   # Resolved
+          close_code: "Resolved by request"
+      delegate_to: localhost
+      when:
+        - not service_was_stopped
+        - recheck_not_stopped.status.ActiveState == 'active'
+
+    - name: End play - false alarm resolved
+      ansible.builtin.meta: end_play
+      when: not service_was_stopped
+
+    # ----------------------------------------------------------
+    # 4b. Service really is stopped -> restart it (circuit breaker: 1 try)
+    # ----------------------------------------------------------
+    - name: Restart the service
+      ansible.builtin.systemd:
+        name: "{{ service_name }}"
+        state: restarted
+      register: restart_result
+      when: service_was_stopped
+
+    - name: Pause briefly to let the service come up
+      ansible.builtin.pause:
+        seconds: 10
+      when: service_was_stopped
+
+    - name: Double-check the service is running now
+      ansible.builtin.systemd:
+        name: "{{ service_name }}"
+      register: post_restart_status
+      when: service_was_stopped
+
+    # ----------------------------------------------------------
+    # 5. "Running OK?" decision diamond
+    # ----------------------------------------------------------
+    - name: Close ticket - service restarted successfully
+      ansible.builtin.uri:
+        url: "{{ snow_instance }}/api/now/table/{{ snow_table }}/{{ ticket_number }}"
+        method: PATCH
+        user: "{{ snow_user }}"
+        password: "{{ snow_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          work_notes: "Service {{ service_name }} on {{ inventory_hostname }} was restarted successfully by AAP."
+          state: "6"   # Resolved
+          close_code: "Resolved by request"
+      delegate_to: localhost
+      when:
+        - service_was_stopped
+        - post_restart_status.status.ActiveState == 'active'
+
+    - name: Notify on-call team - restart failed, needs manual help
+      ansible.builtin.uri:
+        url: "{{ snow_instance }}/api/now/table/{{ snow_table }}/{{ ticket_number }}"
+        method: PATCH
+        user: "{{ snow_user }}"
+        password: "{{ snow_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          work_notes: "Automatic restart of {{ service_name }} on {{ inventory_hostname }} FAILED. Escalating to on-call team for manual remediation. Circuit breaker tripped - no further retries attempted."
+          state: "2"   # In Progress / needs human
+          urgency: "1" # High
+      delegate_to: localhost
+      when:
+        - service_was_stopped
+        - post_restart_status.status.ActiveState != 'active'
